@@ -1,40 +1,23 @@
-// src/lib/siwe-nonce.ts
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 
 /**
  * Self-authenticating SIWE nonces.
  *
- * The previous implementation kept issued nonces in a module-level
- * `Set<string>`. Three problems:
- *
- *   1. On any serverless or multi-instance deployment the instance that issued a
- *      nonce is usually not the one that verifies it, so sign-in failed
- *      intermittently for reasons that look like a wallet bug.
- *   2. The set only ever grew. Every unused `GET /api/auth/verify` leaked 32
- *      bytes for the lifetime of the process, and the endpoint is unauthenticated.
- *   3. Nonces never expired, so a signature captured at any point in the past
- *      stayed replayable for as long as the process lived.
- *
- * A nonce now carries its own expiry and a MAC over both halves, so any instance
- * holding `SESSION_SECRET` can validate it without shared state. Single-use is
- * additionally enforced per-instance on a best-effort basis; strict cluster-wide
- * single-use needs a shared store, and the short lifetime is what bounds the
- * replay window in the meantime.
- *
- * The encoding is pure lowercase hex because SIWE requires the nonce field to be
- * alphanumeric — base64url would be rejected by a conforming parser.
+ * A nonce carries its own timestamped expiry and a truncated HMAC-SHA256 MAC over the
+ * random material and expiry time. Any stateless node possessing SESSION_SECRET
+ * can validate that the nonce was issued locally within the permissible TTL.
  */
 
-/** How long a nonce stays valid. Long enough to sign, short enough to matter. */
+/** Validity window for issued nonces (10 minutes). */
 const NONCE_TTL_SECONDS = 10 * 60
 
-const RANDOM_HEX_LENGTH = 32 // 16 bytes
-const EXPIRY_HEX_LENGTH = 8 // uint32 seconds since the epoch
-const MAC_HEX_LENGTH = 32 // 16 bytes of HMAC-SHA256, truncated
+const RANDOM_HEX_LENGTH = 32 // 16 bytes random hex
+const EXPIRY_HEX_LENGTH = 8  // 4 bytes uint32 epoch seconds in hex
+const MAC_HEX_LENGTH = 32    // 16 bytes truncated HMAC hex
 
 export const NONCE_LENGTH = RANDOM_HEX_LENGTH + EXPIRY_HEX_LENGTH + MAC_HEX_LENGTH
 
-/** Nonces already redeemed on this instance. Bounded; see {@link rememberUsed}. */
+/** Local cache of redeemed nonces to prevent in-flight replays. */
 const usedNonces = new Map<string, number>()
 const MAX_REMEMBERED_NONCES = 10_000
 
@@ -43,8 +26,7 @@ function getKey(): Buffer | null {
   if (!secret || secret.length < 16) {
     return null
   }
-  // Domain-separated from the session token MAC so the two cannot be
-  // substituted for one another.
+  // Domain-separated key to avoid collision with session token HMAC
   return createHmac('sha256', secret).update('siwe-nonce-v1').digest()
 }
 
@@ -62,9 +44,8 @@ function macsMatch(a: string, b: string): boolean {
 }
 
 /**
- * Issues a nonce, or `null` when `SESSION_SECRET` is unset.
- *
- * The returned string is alphanumeric and safe to embed in a SIWE message.
+ * Issues a self-authenticating SIWE nonce.
+ * Returns null if SESSION_SECRET is not configured.
  */
 export function issueNonce(): string | null {
   const key = getKey()
@@ -80,25 +61,22 @@ export function issueNonce(): string | null {
   return `${body}${macFor(body, key)}`
 }
 
-/** Drops expired entries, then caps the table so it cannot grow without bound. */
+/** Prunes expired entries and caps the map capacity. */
 function rememberUsed(nonce: string, expiry: number): void {
   const now = Math.floor(Date.now() / 1000)
-  const stale: string[] = []
-  usedNonces.forEach((entryExpiry: number, entry: string) => {
+  
+  // Evict stale nonces
+  for (const [entry, entryExpiry] of usedNonces.entries()) {
     if (entryExpiry <= now) {
-      stale.push(entry)
+      usedNonces.delete(entry)
     }
-  })
-  stale.forEach((entry) => usedNonces.delete(entry))
+  }
 
+  // Bound memory footprint to MAX_REMEMBERED_NONCES
   if (usedNonces.size >= MAX_REMEMBERED_NONCES) {
-    // Every remaining entry is still live, so evict the oldest rather than
-    // refusing to record this one. Worst case a very old nonce becomes replayable
-    // within its remaining lifetime; refusing to record at all would make every
-    // nonce replayable.
-    const oldest = Array.from(usedNonces.keys())[0]
-    if (oldest !== undefined) {
-      usedNonces.delete(oldest)
+    const oldestKey = usedNonces.keys().next().value
+    if (oldestKey !== undefined) {
+      usedNonces.delete(oldestKey)
     }
   }
 
@@ -108,10 +86,7 @@ function rememberUsed(nonce: string, expiry: number): void {
 export type NonceCheck = 'ok' | 'malformed' | 'expired' | 'reused' | 'unavailable'
 
 /**
- * Validates a nonce and marks it used.
- *
- * @returns `'ok'` only when the nonce was issued by this deployment, has not
- *  expired, and has not already been redeemed on this instance.
+ * Verifies the validity of an incoming SIWE nonce and marks it as spent.
  */
 export function consumeNonce(nonce: unknown): NonceCheck {
   const key = getKey()
@@ -125,7 +100,6 @@ export function consumeNonce(nonce: unknown): NonceCheck {
   const body = nonce.slice(0, RANDOM_HEX_LENGTH + EXPIRY_HEX_LENGTH)
   const mac = nonce.slice(RANDOM_HEX_LENGTH + EXPIRY_HEX_LENGTH)
   if (!macsMatch(mac, macFor(body, key))) {
-    // Not issued here, or tampered with. Same answer either way.
     return 'malformed'
   }
 
