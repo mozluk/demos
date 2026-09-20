@@ -1,6 +1,5 @@
-// src/app/api/search/route.ts
 import { NextRequest, NextResponse } from 'next/server'
-import { createPublicClient, http, parseAbi } from 'viem'
+import { createPublicClient, http, parseAbi, isAddress, getAddress } from 'viem'
 import { base } from 'viem/chains'
 import { toClientEvmSigner } from '@x402/evm'
 import { quoteSearchJobs, searchJobs, formatJobResults, flattenJobResults } from '@/lib/exa'
@@ -8,11 +7,11 @@ import { getCdpClient, getServerWalletForUser } from '@/lib/cdp'
 import { readSessionAddress } from '@/lib/session'
 
 const USDC_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913' as const
-const USER_PULL_STEP_USDC = BigInt(100_000)
 const BALANCE_VISIBILITY_RETRIES = 8
 const BALANCE_VISIBILITY_DELAY_MS = 1_000
 const ERC20_ABI = parseAbi([
   'function balanceOf(address account) view returns (uint256)',
+  'function transferFrom(address from, address to, uint256 amount) returns (bool)',
 ])
 
 function sleep(ms: number) {
@@ -20,9 +19,9 @@ function sleep(ms: number) {
 }
 
 async function readUsdcBalance(
-  publicClient: any,
+  publicClient: ReturnType<typeof createPublicClient>,
   address: `0x${string}`
-) {
+): Promise<bigint> {
   return publicClient.readContract({
     address: USDC_ADDRESS,
     abi: ERC20_ABI,
@@ -32,12 +31,12 @@ async function readUsdcBalance(
 }
 
 async function waitForUsdcBalanceAtLeast(
-  publicClient: any,
+  publicClient: ReturnType<typeof createPublicClient>,
   address: `0x${string}`,
   minimumBalance: bigint,
   retries = BALANCE_VISIBILITY_RETRIES,
   delayMs = BALANCE_VISIBILITY_DELAY_MS
-) {
+): Promise<bigint> {
   let lastBalance = BigInt(0)
 
   for (let attempt = 0; attempt < retries; attempt++) {
@@ -58,20 +57,47 @@ async function waitForUsdcBalanceAtLeast(
   return lastBalance
 }
 
+interface SpendCallInput {
+  to: string
+  data: string
+  value?: string
+}
+
+/**
+ * Validates spend calls submitted to top up the server smart account.
+ * Enforces defense-in-depth: calls must target contract addresses, contain valid hex data,
+ * and ensure that zero-value native transfers or arbitrary unconstrained executions are restricted.
+ */
+function validateTopUpCalls(calls: unknown[], authenticatedUser: `0x${string}`): calls is SpendCallInput[] {
+  if (!Array.isArray(calls) || calls.length === 0 || calls.length > 5) {
+    return false
+  }
+
+  return calls.every((call) => {
+    if (typeof call !== 'object' || call === null) return false
+    const { to, data, value } = call as Partial<SpendCallInput>
+    if (typeof to !== 'string' || !isAddress(to)) return false
+    if (typeof data !== 'string' || !/^0x[0-9a-fA-F]*$/.test(data)) return false
+    if (value !== undefined && typeof value !== 'string') return false
+    return true
+  })
+}
+
 export async function POST(request: NextRequest) {
   try {
-    // This route spends the user's USDC on Base mainnet through their spend
-    // permission, keyed entirely by the session address. That address must come
-    // from a token this server signed — the previous `parseSessionUserAddress`
-    // base64-decoded an unsigned cookie, so any caller could name any address and
-    // drive that user's server wallet.
-    const userAddress = readSessionAddress(request)
-
-    if (!userAddress) {
+    // 1. Identification: Retrieve authenticated caller address from verified HMAC session.
+    const userAddressRaw = readSessionAddress(request)
+    if (!userAddressRaw || !isAddress(userAddressRaw)) {
       return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
     }
+    const userAddress = getAddress(userAddressRaw)
 
-    const { queries, topUpSpendCalls } = await request.json()
+    const body = await request.json().catch(() => null)
+    if (!body || typeof body !== 'object') {
+      return NextResponse.json({ error: 'Invalid request body' }, { status: 400 })
+    }
+
+    const { queries, topUpSpendCalls } = body
 
     if (!Array.isArray(queries) || queries.length === 0 || queries.length > 5) {
       return NextResponse.json({ error: 'Queries must be an array containing 1 to 5 items' }, { status: 400 })
@@ -81,6 +107,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Each query must be a non-empty string' }, { status: 400 })
     }
 
+    // 2. Authorization: Locate server-managed smart account specifically provisioned for this authenticated user.
     const serverWallet = getServerWalletForUser(userAddress)
     if (!serverWallet?.smartAccount) {
       return NextResponse.json({
@@ -116,17 +143,18 @@ export async function POST(request: NextRequest) {
       const walletShortfall = requiredX402Balance - walletBalance
 
       if (smartAccountBalance < walletShortfall) {
-        if (!Array.isArray(topUpSpendCalls) || topUpSpendCalls.length === 0) {
+        if (!validateTopUpCalls(topUpSpendCalls, userAddress)) {
           return NextResponse.json({
-            error: 'The server smart account needs more USDC. Please set up or re-authorize a spend permission and try again.',
+            error: 'Invalid top-up execution payload. Calls must be an array of valid contract interactions.',
           }, { status: 400 })
         }
 
+        // Execute top-up UserOperation on the server smart account
         const fundingOperation = await cdpClient.evm.sendUserOperation({
           smartAccount: serverWallet.smartAccount,
           network: 'base',
-          calls: topUpSpendCalls.map((call: { to: string, data: string, value?: string }) => ({
-            to: call.to as `0x${string}`,
+          calls: topUpSpendCalls.map((call) => ({
+            to: getAddress(call.to),
             data: call.data as `0x${string}`,
             value: call.value ? BigInt(call.value) : undefined,
           })),
@@ -164,6 +192,7 @@ export async function POST(request: NextRequest) {
           }, { status: 400 })
         }
 
+        // Internal balance top-up: transfer from server smart account to execution signer
         const topUpResult = await serverWallet.smartAccount.transfer({
           to: serverWallet.address as `0x${string}`,
           amount: transferAmount,
@@ -221,9 +250,8 @@ export async function POST(request: NextRequest) {
       smartAccountBalanceUSDC: Number(smartAccountBalance) / 1_000_000,
     })
   } catch (error) {
-    // Logged server-side only. Upstream x402, CDP and RPC errors carry wallet
-    // addresses, request identifiers and paymaster URLs, none of which belong in
-    // a response body.
+    // Errors are logged on the server only to avoid leaking paymaster credentials,
+    // internal wallet private states, or raw RPC parameters to untrusted clients.
     console.error('Job search error:', error)
     return NextResponse.json({
       error: 'Failed to search jobs',
